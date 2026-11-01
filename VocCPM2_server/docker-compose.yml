@@ -1,0 +1,49 @@
+services:
+  # 推論サーバ本体。ホストには公開せず、前段の api(キャッシュプロキシ)経由でのみ到達する
+  voxcpm2:
+    image: voccpm2-server:latest
+    build:
+      context: .
+    container_name: voccpm2-server
+    init: true
+    restart: unless-stopped
+    volumes:
+      - ./models:/models:ro
+    environment:
+      THREADS: "${THREADS:-8}"
+      # 1 以外にすると同時リクエストで性能が約半分に劣化する(README参照)
+      HTTP_THREADS: "${HTTP_THREADS:-1}"
+      BASELM_FILE: "${BASELM_FILE:-VoxCPM2-BaseLM-Q8_0.gguf}"
+      ACOUSTIC_FILE: "VoxCPM2-Acoustic-F16.gguf"
+      PORT: "8080"
+      EXTRA_ARGS: "${EXTRA_ARGS:-}"
+
+  # 音声キャッシュ付きプロキシ。利用者が叩くのはこちら(標準ライブラリのみの Python スクリプト)
+  api:
+    image: python:3.12-slim-bookworm
+    container_name: voccpm2-api
+    init: true
+    restart: unless-stopped
+    depends_on:
+      voxcpm2:
+        condition: service_healthy
+    command: ["python", "-u", "/app/cache_proxy.py"]
+    ports:
+      # 既定は自分のPCからのみ(認証が無いため)。LAN公開は .env の BIND_ADDR=0.0.0.0
+      - "${BIND_ADDR:-127.0.0.1}:${PORT:-8080}:8080"
+    volumes:
+      - ./proxy:/app:ro
+      # キャッシュ(音声ファイルと管理表 index.jsonl)の置き場。ホスト側のフォルダ
+      - "${CACHE_DIR:-./cache}:/cache"
+    environment:
+      PORT: "8080"
+      UPSTREAM_HOST: "voxcpm2"
+      UPSTREAM_PORT: "8080"
+      CACHE_DIR: "/cache"
+      CACHE_ENABLED: "${CACHE_ENABLED:-1}"
+      CACHE_MAX_MB: "${CACHE_MAX_MB:-1024}"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('127.0.0.1', 8080), 3).close()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3

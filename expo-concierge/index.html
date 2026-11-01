@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+  <title>AI Concierge</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="app" data-state="welcome">
+    <header class="topbar">
+      <span class="brand" id="brand"></span>
+      <span class="booth" id="booth"></span>
+    </header>
+
+    <section class="stage" aria-label="アバター">
+      <canvas id="avatar" class="avatar"></canvas>
+      <div class="status" aria-live="polite">
+        <span class="status-name" id="assistant-name"></span>
+        <span class="status-text" id="status-text"></span>
+      </div>
+      <p class="footnote" id="footnote"></p>
+    </section>
+
+    <main class="dialog">
+      <div class="qa-head">
+        <p class="question" id="question" hidden></p>
+        <div class="dialog-tools">
+          <button type="button" class="ghost" id="stop-btn" hidden>読み上げを止める</button>
+          <button type="button" class="ghost" id="home-btn" hidden>はじめに戻る</button>
+        </div>
+      </div>
+
+      <div class="bubble" id="bubble">
+      <div class="answer-area" id="answer-area">
+        <div class="welcome" id="welcome">
+          <h1 class="welcome-title" id="greeting-title"></h1>
+          <p class="welcome-body" id="greeting-body"></p>
+        </div>
+        <div class="qa" id="qa" hidden>
+          <p class="question-inline" id="question-inline"></p>
+          <div class="thinking" id="thinking" hidden>
+            <span class="dots" aria-hidden="true"><i></i><i></i><i></i></span>
+            <span id="thinking-text"></span>
+          </div>
+          <div class="answer" id="answer"></div>
+          <ul class="sources" id="sources" hidden></ul>
+        </div>
+      </div>
+      </div>
+
+      <nav class="presets" aria-label="よくあるご質問">
+        <p class="presets-heading">よくあるご質問</p>
+        <div class="preset-grid" id="presets"></div>
+      </nav>
+
+      <form class="ask" id="ask-form" autocomplete="off">
+        <input class="ask-input" id="ask-input" type="text" maxlength="300" enterkeyhint="send">
+        <button class="ask-send" type="submit" id="ask-send">質問する</button>
+      </form>
+    </main>
+  </div>
+
+  <pre class="debug" id="debug" hidden></pre>
+
+  <script src="config.js"></script>
+  <script src="tts.js"></script>
+  <script src="text.js"></script>
+  <script src="gryphon.js"></script>
+  <script src="speaker.js"></script>
+  <script src="avatar.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

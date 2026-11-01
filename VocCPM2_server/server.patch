@@ -1,0 +1,48 @@
+diff --git a/tools/server/server-voxcpm2.cpp b/tools/server/server-voxcpm2.cpp
+index 6d22e47..24aa546 100644
+--- a/tools/server/server-voxcpm2.cpp
++++ b/tools/server/server-voxcpm2.cpp
+@@ -172,6 +172,9 @@ static std::vector<float> voxcpm2_load_wav_from_memory(const std::vector<uint8_t
+ 
+ // ─── Server state ─────────────────────────────────────────────────────────
+ 
++// tts-bench patch: the runtime is not thread-safe; serialize generation across HTTP threads.
++static std::mutex g_generate_mutex;
++
+ struct voxcpm2_server_state {
+     VoxCPM2Runtime * runtime = nullptr;
+     std::mutex mutex;
+@@ -296,6 +299,7 @@ int main(int argc, char ** argv) {
+ 
+     svr.Post("/v1/audio/speech", [&](const httplib::Request & req, httplib::Response & res) {
+         LOG_INF("handle_audio_speech\n");
++        std::lock_guard<std::mutex> generate_lock(g_generate_mutex);
+         json data = json::parse(req.body);
+ 
+         std::string input = json_value(data, "input", std::string(""));
+@@ -320,7 +324,7 @@ int main(int argc, char ** argv) {
+         gen_params.seed                = json_value(data, "seed", 42);
+         gen_params.cfg_value           = json_value(data, "cfg_value", 2.0f);
+         gen_params.inference_timesteps = json_value(data, "inference_timesteps", 10);
+-        gen_params.max_steps           = json_value(data, "max_steps", 200);
++        gen_params.max_steps           = json_value(data, "max_steps", 4096);
+         gen_params.temperature         = json_value(data, "temperature", 1.0f);
+ 
+         VoxCPM2Runtime * rt = nullptr;
+@@ -403,7 +407,7 @@ int main(int argc, char ** argv) {
+         gen_params.seed                = json_value(data, "seed", 42);
+         gen_params.cfg_value           = json_value(data, "cfg_value", 2.0f);
+         gen_params.inference_timesteps = json_value(data, "inference_timesteps", 10);
+-        gen_params.max_steps           = json_value(data, "max_steps", 200);
++        gen_params.max_steps           = json_value(data, "max_steps", 4096);
+         gen_params.temperature         = json_value(data, "temperature", 1.0f);
+ 
+         VoxCPM2Runtime * rt = nullptr;
+@@ -421,6 +425,7 @@ int main(int argc, char ** argv) {
+         res.set_chunked_content_provider(
+             "audio/wav",
+             [rt, input, gen_params, sr, data](size_t /*offset*/, httplib::DataSink & sink) -> bool {
++                std::lock_guard<std::mutex> generate_lock(g_generate_mutex);
+                 // Write WAV header first (with unknown data size)
+                 {
+                     std::string header;

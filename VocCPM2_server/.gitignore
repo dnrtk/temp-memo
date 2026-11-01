@@ -1,0 +1,9 @@
+# 重み(数GB)
+models/
+# smoke-test の出力
+out/
+# 音声キャッシュ(音声ファイルと管理表 index.jsonl)
+cache/
+# Python のバイトコード
+__pycache__/
+*.pyc
