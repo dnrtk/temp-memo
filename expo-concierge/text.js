@@ -104,14 +104,13 @@
 
   // ストリームで届く回答を読み上げ単位に切る。
   //   1. まず文(。！？改行)単位に切る
-  //   2. 1文、または続く数文が、TTSサーバのキャッシュ済みの文と同じ内容なら、
-  //      キャッシュ済みの文字列をそのまま1かたまりにする(生成を待たずに鳴らせる)
-  //      キャッシュ済みの文の書き出しと一致している間は、続きの文を待ってから判断する
-  //   3. それ以外は、短い文をまとめ、長い文は読点で切る。最初のかたまりだけは
-  //      読点でも早めに切って、声が出るまでの時間を縮める
+  //   2. 短い文をまとめ、長い文は読点で切る。firstCut のときは最初のかたまりだけ
+  //      読点でも早めに切って、声が出るまでの時間を縮める(文単位のキャッシュには当たらなくなる)
+  // 返す { text, end } の end は、push してきた文字列の通算で、そのかたまりがどこまでに当たるか
+  // (話し始めたときに画面に出す範囲)
   class SpeechPlanner {
-    constructor({ cache, minChars = 12, maxChars = 90 } = {}) {
-      this.cache = cache;
+    constructor({ minChars = 12, maxChars = 90, firstCut = false } = {}) {
+      this.firstCut = firstCut;
       this.minChars = minChars;
       this.maxChars = maxChars;
       this.reset();
@@ -119,8 +118,10 @@
 
     reset() {
       this.buf = '';
+      this.consumed = 0; // buf より前に切り出し済みの文字数
       this.pending = [];
       this.plain = '';
+      this.plainEnd = 0;
       this.emitted = 0;
     }
 
@@ -139,60 +140,36 @@
 
     _takeSentences(final) {
       const raw = [];
+      const take = (n) => {
+        this.consumed += n;
+        raw.push({ text: this.buf.slice(0, n), end: this.consumed });
+        this.buf = this.buf.slice(n);
+      };
       let i;
-      while ((i = this.buf.search(/[。！？!?\n]/)) >= 0) {
-        raw.push(this.buf.slice(0, i + 1));
-        this.buf = this.buf.slice(i + 1);
-      }
+      while ((i = this.buf.search(/[。！？!?\n]/)) >= 0) take(i + 1);
       // 句点が来ないまま長くなった場合は読点で区切る
       while (this.buf.length > this.maxChars * 1.5) {
         const j = this.buf.lastIndexOf('、', this.maxChars);
-        const k = j > 10 ? j : this.maxChars - 1;
-        raw.push(this.buf.slice(0, k + 1));
-        this.buf = this.buf.slice(k + 1);
+        take((j > 10 ? j : this.maxChars - 1) + 1);
       }
-      if (final && this.buf) {
-        raw.push(this.buf);
-        this.buf = '';
-      }
-      return raw.map(cleanForSpeech).filter(Boolean);
+      if (final && this.buf) take(this.buf.length);
+      return raw.map((r) => ({ text: cleanForSpeech(r.text), end: r.end })).filter((r) => r.text);
     }
 
     _drain(final) {
       const out = [];
-      const c = this.cache;
-      while (this.pending.length) {
-        if (c && !final && c.hasLongerPrefix(CX.normKey(this.pending.join('')))) break;
-        let best = 0;
-        let hit = null;
-        if (c) {
-          for (let k = 1; k <= this.pending.length; k++) {
-            const t = c.lookup(this.pending.slice(0, k).join(''));
-            if (t) {
-              best = k;
-              hit = t;
-            }
-          }
-        }
-        if (best) {
-          this._flushPlain(out);
-          out.push({ text: hit, cached: true });
-          this.emitted++;
-          this.pending.splice(0, best);
-        } else {
-          this._addPlain(out, this.pending.shift());
-        }
-      }
+      while (this.pending.length) this._addPlain(out, this.pending.shift());
       if (final) this._flushPlain(out);
       return out;
     }
 
     _addPlain(out, sentence) {
-      for (let piece of splitLong(sentence, this.maxChars)) {
-        if (this.emitted === 0 && !this.plain && piece.length > 30) {
+      const end = sentence.end;
+      for (let piece of splitLong(sentence.text, this.maxChars)) {
+        if (this.firstCut && this.emitted === 0 && !this.plain && piece.length > 30) {
           const j = piece.indexOf('、', 8);
           if (j > 0 && j < piece.length - 6) {
-            out.push({ text: piece.slice(0, j + 1), cached: false });
+            out.push({ text: piece.slice(0, j + 1), end });
             this.emitted++;
             piece = piece.slice(j + 1);
           }
@@ -201,13 +178,14 @@
         // 箇条書きの項目など句読点のない切れ目には読点を補って、続けて読まないようにする
         if (this.plain && !/[。、！？!?,.]$/.test(this.plain)) this.plain += '、';
         this.plain += piece;
+        this.plainEnd = end;
         if (this.plain.length >= this.minChars) this._flushPlain(out);
       }
     }
 
     _flushPlain(out) {
       if (!this.plain) return;
-      out.push({ text: this.plain, cached: false });
+      out.push({ text: this.plain, end: this.plainEnd });
       this.emitted++;
       this.plain = '';
     }

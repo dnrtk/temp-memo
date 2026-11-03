@@ -29,22 +29,37 @@
     tts: {
       enabled: true,
       baseUrl: '/tts',
+      // true: /events で文ごとに受け取り、届いた分から鳴らす / false: /v1/audio/speech で一括
+      streaming: true,
       speechPath: '/v1/audio/speech',
-      cachePath: '/cache/texts',
-      params: { inference_timesteps: 5 },
-      timeoutMs: 60000,
+      eventsPath: '/v1/audio/speech/events',
+      healthPath: '/health',
+      // サーバ側の区切り方 'sentence' / 'clause'(読点でも区切る。先頭は早いが抑揚が不自然になりやすい)
+      split: 'sentence',
+      // speaker / style / speed / intonation_scale / pitch_scale など。省略するとサーバの既定値
+      params: {},
+      timeoutMs: 120000,
       concurrency: 1,
-      cacheRefreshSec: 300,
-      fuzzyMatch: 0
+      // 無音から鳴り始めるとき、これだけ待ってから鳴らす(続きの文の合成が間に合うように)。
+      // キャッシュから届いた音声は待たない
+      prebufferMs: 800
     },
     voice: {
       ackPhrase: '確認しますので、少々お待ちください。',
+      // 質問してからこの時間内に回答の最初の文を読み上げに回せたら、ackPhrase は言わない
+      ackDelayMs: 1500,
       cutoffPhrase: '続きは画面でご覧ください。',
       maxSpeechChars: 400,
       // 起動時に合成しておく決まり文句(回答ルールで使わせている締めの一文など)
       warmPhrases: ['詳しくはブーススタッフにお尋ねください。'],
+      // 待機中に1行ずつ合成させて serve.py のキャッシュに入れておく文の一覧(空文字で無効)
+      warmFile: 'tts-phrases.txt',
       minSegmentChars: 12,
-      maxSegmentChars: 90
+      maxSegmentChars: 90,
+      // 回答の最初の文を読点で早めに切って先に鳴らす。速くなるが、その文はキャッシュに当たらなくなる
+      firstSegmentCut: false,
+      // 回答のテキストを、その部分を話し始めたときに画面に出す(false で届いたらすぐ出す)
+      syncText: true
     },
     ui: {
       layout: 'bubble',
@@ -59,6 +74,9 @@
       idleResetSec: 90,
       thinkingMessages: ['ご質問を確認しています', '社内の資料とWebを調べています', '回答をまとめています'],
       showProgressTitles: false,
+      // 回答の文字をふわっと出す時間(ms。0 でなし)と、1文字ずつ出す速さ(文字/秒)
+      fadeMs: 700,
+      typeCharsPerSec: 40,
       errorMessage: '回答を取得できませんでした。少し時間をおいてもう一度お試しいただくか、近くのスタッフにお声がけください。'
     },
     presets: []
@@ -134,8 +152,9 @@
   // ---------- 音声 ----------
   const tts = new CX.TtsClient(cfg.tts, log);
   const speaker = new CX.Speaker({
-    synthesize: (text) => tts.synthesize(text),
+    synthesize: (text, opts) => tts.synthesize(text, opts),
     concurrency: cfg.tts.concurrency,
+    prebufferMs: cfg.tts.prebufferMs,
     enabled: cfg.tts.enabled,
     onError: (msg) => log(`[失敗] ${msg}`),
     onBusyChange: () => {
@@ -145,12 +164,12 @@
   });
   const thinkFilter = new CX.ThinkFilter();
   const planner = new CX.SpeechPlanner({
-    cache: tts,
     minChars: voice.minSegmentChars,
-    maxChars: voice.maxSegmentChars
+    maxChars: voice.maxSegmentChars,
+    firstCut: voice.firstSegmentCut
   });
 
-  // 起動時: キャッシュ一覧を取り、決まり文句を先に用意しておく(未キャッシュならここで生成される)
+  // 起動時: 決まり文句を先に合成してメモリに置いておく
   async function warmUp() {
     if (debugOn) {
       try {
@@ -161,15 +180,50 @@
       }
     }
     if (!cfg.tts.enabled) return;
-    await tts.refreshCache();
+    await tts.health();
     for (const p of [voice.ackPhrase, voice.cutoffPhrase, ui.errorMessage, ...(voice.warmPhrases || [])]) {
-      if (p) await speaker.preload(tts.resolve(p));
+      if (p) await speaker.preload(p);
     }
     log('決まり文句の準備完了');
+    await warmCache();
   }
   warmUp();
-  if (cfg.tts.enabled && cfg.tts.cacheRefreshSec > 0) {
-    setInterval(() => tts.refreshCache(), cfg.tts.cacheRefreshSec * 1000);
+
+  // tts-phrases.txt の文を、読み上げていない間に1つずつ合成させる(キャッシュ済みならすぐ終わる)
+  // 質問を受けてから答え終わるまでは TTS サーバを空けておく
+  const ttsIdle = () => !speaker.isBusy() && state !== 'thinking' && state !== 'answering';
+  async function warmCache() {
+    if (!voice.warmFile) return;
+    let lines;
+    try {
+      const res = await fetch(voice.warmFile, { signal: AbortSignal.timeout(5000) });
+      if (!res.ok) return;
+      lines = (await res.text())
+        .split(/\r?\n/)
+        .map((l) => l.trim())
+        .filter((l) => l && !l.startsWith('#'));
+    } catch {
+      return;
+    }
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    let failed = 0;
+    for (let i = 0; i < lines.length; ) {
+      while (!ttsIdle()) await sleep(1000);
+      // 来場者への読み上げが始まったら切って、TTS サーバを空ける(この行は後でやり直す)
+      const ctrl = new AbortController();
+      const watch = setInterval(() => !ttsIdle() && ctrl.abort(), 200);
+      try {
+        await tts.synthesize(lines[i], { signal: ctrl.signal, quiet: true });
+      } catch (err) {
+        if (err.name !== 'AbortError') failed++;
+      } finally {
+        clearInterval(watch);
+      }
+      if (ctrl.signal.aborted) continue;
+      i++;
+      if (i % 10 === 0) log(`事前合成 ${i}/${lines.length}`);
+    }
+    log(`事前合成 完了 ${lines.length}件${failed ? ` (失敗 ${failed}件)` : ''}`);
   }
 
   // ---------- アバター ----------
@@ -267,10 +321,19 @@
   // ---------- 状態 ----------
   let state = 'welcome';
   let answerText = '';
+  // 読み上げに合わせて表示するとき、answerText のどこまでを出しているか
+  const syncText = !!cfg.tts.enabled && voice.syncText !== false;
+  let shownEnd = 0;
+  let showAll = false;
   let spokenChars = 0;
   let speechCut = false;
   let streamDone = false;
   let thinkingTimer = null;
+  let ackTimer = null;
+  function cancelAck() {
+    clearTimeout(ackTimer);
+    ackTimer = null;
+  }
   let idleTimer = null;
   let stickToBottom = true;
 
@@ -327,11 +390,112 @@
   }
 
   // ---------- 描画 ----------
+  // 書きかけの強調・コードを閉じて、途中まででも記号がちらつかないようにする
+  function closeMarks(md) {
+    let s = md;
+    for (const m of ['**', '__', '`']) if (s.split(m).length % 2 === 0) s += m;
+    return s;
+  }
+
+  let rendered = -1; // 前回描画した answerText の文字数
   function renderAnswer() {
-    const { html, refs } = CX.renderMarkdown(answerText, !streamDone);
+    const end = syncText ? Math.min(Math.floor(shownEnd), answerText.length) : answerText.length;
+    const done = streamDone && end >= answerText.length;
+    const { html, refs } = CX.renderMarkdown(done ? answerText : closeMarks(answerText.slice(0, end)), !done);
+    rendered = end;
     el.answer.innerHTML = html;
+    applyFade();
+    el.answer.classList.toggle('streaming', state === 'answering' && !done);
     if (refs.length) showSources(refs);
     if (stickToBottom) el.area.scrollTop = el.area.scrollHeight;
+  }
+
+  // 新しく出た文字を span.fx で包んでふわっと出す。描画し直しても続きから動くように、
+  // 文字ごとに出た時刻を覚えておき、その分だけ animation-delay を負にする
+  const fadeMs = Math.max(0, Number(ui.fadeMs) || 0);
+  el.answer.style.setProperty('--fx-ms', `${fadeMs}ms`);
+  let charTimes = []; // 表示上の文字の位置 → 最初に出た時刻
+  function applyFade() {
+    if (!fadeMs) return;
+    const now = performance.now();
+    const walker = document.createTreeWalker(el.answer, NodeFilter.SHOW_TEXT);
+    const nodes = [];
+    while (walker.nextNode()) nodes.push(walker.currentNode);
+    let idx = 0;
+    for (const node of nodes) {
+      const chars = Array.from(node.nodeValue);
+      let first = -1;
+      for (let k = 0; k < chars.length; k++) {
+        if (charTimes[idx + k] === undefined) charTimes[idx + k] = now;
+        if (first < 0 && now - charTimes[idx + k] < fadeMs) first = k;
+      }
+      if (first >= 0) {
+        const frag = document.createDocumentFragment();
+        if (first) frag.append(chars.slice(0, first).join(''));
+        for (let k = first; k < chars.length; k++) {
+          const age = now - charTimes[idx + k];
+          if (age >= fadeMs) {
+            frag.append(chars[k]);
+            continue;
+          }
+          const sp = document.createElement('span');
+          sp.className = 'fx';
+          sp.textContent = chars[k];
+          sp.style.animationDelay = `${-Math.round(age)}ms`;
+          frag.append(sp);
+        }
+        node.replaceWith(frag);
+      }
+      idx += chars.length;
+    }
+    charTimes.length = Math.min(charTimes.length, idx);
+  }
+
+  // shownEnd を targetEnd まで少しずつ進める(全文が届いていても1文字ずつ出す)
+  let targetEnd = 0;
+  const typeRate = Math.max(1, Number(ui.typeCharsPerSec) || 40); // 文字/秒
+  let rafId = 0;
+  let lastTs = 0;
+  function tick(now) {
+    rafId = 0;
+    const dt = Math.min(0.1, (now - lastTs) / 1000);
+    lastTs = now;
+    const target = Math.min(targetEnd, answerText.length);
+    if (shownEnd < target) shownEnd = Math.min(target, shownEnd + typeRate * dt);
+    if (Math.floor(shownEnd) !== rendered) renderAnswer();
+    if (shownEnd < target) rafId = requestAnimationFrame(tick);
+  }
+  function kickTyping() {
+    if (rafId) return;
+    lastTs = performance.now();
+    rafId = requestAnimationFrame(tick);
+  }
+  function resetReveal() {
+    cancelAnimationFrame(rafId);
+    rafId = 0;
+    shownEnd = 0;
+    targetEnd = 0;
+    showAll = false;
+    rendered = -1;
+    charTimes = [];
+  }
+
+  // 読み上げが answerText の end 文字目までに当たる部分を話し始めたので、そこまでを
+  // ui.typeCharsPerSec の速さで出していく(発話の速さには合わせない)
+  function reveal(end) {
+    if (state !== 'thinking' && state !== 'answering') return;
+    targetEnd = Math.max(targetEnd, end);
+    if (state === 'thinking') {
+      stopThinkingTicker();
+      setState('answering');
+    }
+    kickTyping();
+  }
+
+  // 残りを全部出す(読み上げを止めた・打ち切った・読み上げ終わった)
+  function revealAll() {
+    showAll = true;
+    reveal(Infinity);
   }
 
   function showSources(list) {
@@ -356,11 +520,14 @@
       if (speechCut) return;
       if (spokenChars + seg.text.length > voice.maxSpeechChars) {
         speechCut = true;
-        if (voice.cutoffPhrase) speaker.enqueue(tts.resolve(voice.cutoffPhrase));
+        // 読み上げはここまで。残りは「続きは画面で」を話し始めたときにまとめて出す
+        if (voice.cutoffPhrase) speaker.enqueue(voice.cutoffPhrase, { onStart: revealAll });
+        else revealAll();
         return;
       }
       spokenChars += seg.text.length;
-      speaker.enqueue(seg.text);
+      if (ackTimer) cancelAck(); // 回答がすぐ来たので「確認しますので…」は言わない
+      speaker.enqueue(seg.text, { onStart: () => reveal(seg.end) });
     }
   }
 
@@ -374,6 +541,7 @@
     thinkFilter.reset();
 
     answerText = '';
+    resetReveal();
     spokenChars = 0;
     speechCut = false;
     streamDone = false;
@@ -398,7 +566,13 @@
 
     setState('thinking');
     startThinkingTicker();
-    if (voice.ackPhrase) speaker.enqueue(tts.resolve(voice.ackPhrase));
+    cancelAck();
+    if (voice.ackPhrase) {
+      ackTimer = setTimeout(() => {
+        ackTimer = null;
+        speaker.enqueue(voice.ackPhrase);
+      }, Math.max(0, Number(voice.ackDelayMs) || 0));
+    }
 
     log(`質問: ${query}`);
     chat.ask(query, onEvent);
@@ -412,7 +586,9 @@
       case 'replace':
         thinkFilter.reset();
         answerText = CX.stripThinking(ev.text);
-        renderAnswer();
+        // 全体が差し替わると読み上げとの対応が取れないので、表示は全部出す
+        if (syncText) revealAll();
+        else renderAnswer();
         break;
       case 'progress':
         if (ui.showProgressTitles && ev.title && state === 'thinking') el.thinkingText.textContent = ev.title;
@@ -423,12 +599,13 @@
       case 'done':
         appendVisible(thinkFilter.flush());
         streamDone = true;
-        stopThinkingTicker();
         if (!answerText.trim()) return fail();
-        renderAnswer();
         speak(planner.flush());
-        if (state === 'thinking') setState('answering');
-        el.answer.classList.remove('streaming');
+        if (!syncText) {
+          stopThinkingTicker();
+          renderAnswer();
+          if (state === 'thinking') setState('answering');
+        }
         maybeFinish();
         break;
       case 'error':
@@ -443,6 +620,7 @@
       // それまでの出力も考え中だった(開始タグなしで </think> が来た)ので、なかったことにする
       log('Thinking部分を検出したので、それまでの表示を消しました');
       answerText = '';
+      resetReveal();
       spokenChars = 0;
       speechCut = false;
       planner.reset();
@@ -456,21 +634,25 @@
     if (!text) return;
     if (!answerText && !text.trim()) return; // 考え中ブロック直後の空行は捨てる
     if (!answerText) text = text.replace(/^\s+/, '');
-    if (state === 'thinking') {
+    if (state === 'thinking' && !syncText) {
       stopThinkingTicker();
       setState('answering');
     }
+    // planner に渡す文字列と answerText を同じにしておく(seg.end が answerText の位置になる)
     answerText += text;
-    renderAnswer();
+    if (!syncText) renderAnswer();
+    else if (showAll) revealAll();
     speak(planner.push(text));
   }
 
   function fail() {
     stopThinkingTicker();
+    cancelAck();
     streamDone = true;
     speaker.stop();
     planner.reset();
     thinkFilter.reset();
+    resetReveal();
     el.answer.classList.remove('streaming');
     el.answer.classList.add('error');
     el.answer.innerHTML = '';
@@ -478,11 +660,15 @@
     p.textContent = ui.errorMessage;
     el.answer.appendChild(p);
     setState('error');
-    speaker.enqueue(tts.resolve(ui.errorMessage));
+    speaker.enqueue(ui.errorMessage);
   }
 
   function maybeFinish() {
-    if (state === 'answering' && streamDone && !speaker.isBusy()) setState('answered');
+    if (!streamDone || speaker.isBusy()) return;
+    if (state !== 'answering' && !(syncText && state === 'thinking')) return;
+    // 読み上げなかった部分(参照リンクの行や、合成に失敗した文)も含めて全部出す
+    if (syncText) revealAll();
+    setState('answered');
   }
 
   // ---------- 操作 ----------
@@ -498,18 +684,26 @@
     ask(el.input.value);
   });
   el.stop.addEventListener('click', () => {
+    cancelAck();
     speaker.stop();
     speechCut = true;
+    // 読み上げを止めたら、まだ出していないテキストは全部出す(以後届く分もすぐ出る)
+    if (syncText) {
+      if (answerText) revealAll();
+      else showAll = true;
+    }
   });
   el.home.addEventListener('click', () => resetToWelcome());
 
   function resetToWelcome() {
     chat.reset();
     stopThinkingTicker();
+    cancelAck();
     speaker.stop();
     planner.reset();
     thinkFilter.reset();
     answerText = '';
+    resetReveal();
     el.qa.hidden = true;
     el.question.hidden = true;
     el.welcome.hidden = false;

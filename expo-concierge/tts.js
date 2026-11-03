@@ -1,136 +1,127 @@
 'use strict';
-// VoxCPM2 サーバのクライアント。
-//   POST {baseUrl}/v1/audio/speech  { input, ...params }  → wav
-//   GET  {baseUrl}/cache/texts      → { texts: [...] }
-// サーバにキャッシュ済みの文の一覧を持っておき、読み上げたい文と内容が同じなら
-// キャッシュ済みの文字列そのものを送る(サーバ側で生成をスキップさせる)。
+// AivisSpeech TTS サーバのクライアント。
+//   streaming: true  → POST {baseUrl}/v1/audio/speech/events  NDJSON で文ごとに PCM16 が届く
+//   streaming: false → POST {baseUrl}/v1/audio/speech         WAV を一括で受け取る
+// 文ごとの音声は onChunk に渡す。ストリーミング時は { sampleRate, samples: Float32Array }、
+// 一括時は WAV の ArrayBuffer。
 (function (CX) {
   const join = (base, path) => String(base || '').replace(/\/+$/, '') + path;
 
-  // 比較用のキー。句読点・記号・空白・全角半角・大文字小文字の違いを無視する
-  function normKey(s) {
-    return String(s || '')
-      .normalize('NFKC')
-      .toLowerCase()
-      .replace(/[^\p{L}\p{N}]/gu, '');
+  function pcm16ToFloat(bytes) {
+    const n = bytes.length >> 1;
+    const view = new DataView(bytes.buffer, bytes.byteOffset, n * 2);
+    const out = new Float32Array(n);
+    for (let i = 0; i < n; i++) out[i] = view.getInt16(i * 2, true) / 32768;
+    return out;
   }
 
-  // 0..1 の類似度(1 - 編集距離/長い方の長さ)
-  function similarity(a, b) {
-    if (a === b) return 1;
-    const m = a.length;
-    const n = b.length;
-    if (!m || !n) return 0;
-    let prev = Array.from({ length: n + 1 }, (_, j) => j);
-    for (let i = 1; i <= m; i++) {
-      const cur = [i];
-      for (let j = 1; j <= n; j++) {
-        cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
-      }
-      prev = cur;
+  function base64ToBytes(b64) {
+    const bin = atob(b64);
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  }
+
+  async function errorDetail(res) {
+    const body = await res.text().catch(() => '');
+    try {
+      return JSON.parse(body).error.message || body;
+    } catch {
+      return body.slice(0, 120);
     }
-    return 1 - prev[n] / Math.max(m, n);
   }
 
   class TtsClient {
     constructor(cfg, log) {
       this.cfg = cfg;
       this.log = log || (() => {});
-      this.byKey = new Map(); // normKey → キャッシュ済みの文字列
     }
 
-    get size() {
-      return this.byKey.size;
-    }
-
-    async refreshCache() {
+    async health() {
       try {
-        const res = await fetch(join(this.cfg.baseUrl, this.cfg.cachePath), { signal: AbortSignal.timeout(5000) });
+        const res = await fetch(join(this.cfg.baseUrl, this.cfg.healthPath), { signal: AbortSignal.timeout(5000) });
+        const json = await res.json().catch(() => ({}));
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const json = await res.json();
-        const texts = Array.isArray(json.texts) ? json.texts : [];
-        this.byKey.clear();
-        for (const t of texts) this._remember(t);
-        this.log(`TTSキャッシュ ${this.byKey.size}件を取得`);
+        this.log(`TTS: ${json.engine || '?'} ${json.status || ''}`);
         return true;
       } catch (err) {
-        this.log(`TTSキャッシュ一覧を取得できません: ${err.message}`);
+        this.log(`TTSサーバに接続できません: ${err.message}`);
         return false;
       }
     }
 
-    _remember(text) {
-      const k = normKey(text);
-      if (k && !this.byKey.has(k)) this.byKey.set(k, text);
-    }
-
-    // 内容が同じ(またはfuzzyMatch以上に近い)キャッシュ済みの文。なければ null
-    lookup(text) {
-      const k = normKey(text);
-      if (!k) return null;
-      const exact = this.byKey.get(k);
-      if (exact) return exact;
-      const th = Number(this.cfg.fuzzyMatch) || 0;
-      if (th <= 0 || k.length < 8) return null;
-      let best = null;
-      let bestScore = th;
-      for (const [kk, t] of this.byKey) {
-        if (Math.abs(kk.length - k.length) > Math.ceil(k.length * (1 - th))) continue;
-        const s = similarity(k, kk);
-        if (s >= bestScore) {
-          bestScore = s;
-          best = t;
-        }
+    // 合成が終わると resolve。signal で中断するとサーバ側も次の文から合成を止める
+    async synthesize(text, { signal, onChunk, quiet = false } = {}) {
+      const log = quiet ? () => {} : this.log;
+      const streaming = this.cfg.streaming !== false;
+      const path = streaming ? this.cfg.eventsPath : this.cfg.speechPath;
+      const body = { ...(this.cfg.params || {}), input: text };
+      if (streaming) {
+        body.stream_format = 'ndjson';
+        if (this.cfg.split) body.split = this.cfg.split;
       }
-      return best;
-    }
-
-    // key(normKey済み)で始まる、より長いキャッシュ済みの文があるか
-    hasLongerPrefix(key) {
-      if (!key) return false;
-      for (const kk of this.byKey.keys()) {
-        if (kk.length > key.length && kk.startsWith(key)) return true;
-      }
-      return false;
-    }
-
-    resolve(text) {
-      return this.lookup(text) || text;
-    }
-
-    async synthesize(text) {
-      const cached = this.byKey.get(normKey(text)) === text;
+      const timeout = AbortSignal.timeout(this.cfg.timeoutMs);
       const t0 = performance.now();
       let res;
       try {
-        res = await fetch(join(this.cfg.baseUrl, this.cfg.speechPath), {
+        res = await fetch(join(this.cfg.baseUrl, path), {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ ...(this.cfg.params || {}), input: text }),
-          signal: AbortSignal.timeout(this.cfg.timeoutMs)
+          headers: { 'Content-Type': 'application/json; charset=utf-8' },
+          body: JSON.stringify(body),
+          signal: signal ? AbortSignal.any([signal, timeout]) : timeout
         });
       } catch (err) {
-        this.log(`[失敗] TTSに接続できません: ${err.message} (${text})`);
+        if (err.name !== 'AbortError') this.log(`[失敗] TTSに接続できません: ${err.message} (${text})`);
         throw err;
       }
       if (!res.ok) {
-        const detail = (await res.text().catch(() => '')).slice(0, 120);
+        const detail = await errorDetail(res);
         this.log(`[失敗] TTS HTTP ${res.status} ${detail} (${text})`);
         throw new Error(`TTS HTTP ${res.status}`);
       }
-      const buf = await res.arrayBuffer();
-      if (!buf.byteLength) {
-        this.log(`[失敗] TTSの応答が空です (${text})`);
-        throw new Error('empty audio');
+
+      if (!streaming) {
+        const buf = await res.arrayBuffer();
+        if (!buf.byteLength) throw new Error('empty audio');
+        log(`[生成] ${Math.round(performance.now() - t0)}ms ${text}`);
+        onChunk && onChunk(buf);
+        return;
       }
-      this.log(`${cached ? '[キャッシュ]' : '[生成]'} ${Math.round(performance.now() - t0)}ms ${text}`);
-      // 生成した文はサーバ側でキャッシュされる前提で、一覧にも加えておく
-      this._remember(text);
-      return buf;
+
+      let sampleRate = 48000;
+      const handle = (ev) => {
+        if (ev.type === 'start') {
+          sampleRate = ev.sample_rate || sampleRate;
+        } else if (ev.type === 'audio') {
+          // cached と sample_rate は serve.py のキャッシュ経由のときだけ付く
+          const tag = ev.cached === undefined ? '[受信]' : ev.cached ? '[キャッシュ]' : '[生成]';
+          log(`${tag} ${Math.round(performance.now() - t0)}ms ${ev.text || text}`);
+          onChunk &&
+            onChunk({ sampleRate: ev.sample_rate || sampleRate, samples: pcm16ToFloat(base64ToBytes(ev.audio)), cached: !!ev.cached });
+        } else if (ev.type === 'error') {
+          this.log(`[失敗] TTS ${ev.status} ${ev.message} (${text})`);
+          throw new Error(`TTS stream error ${ev.status}`);
+        } else if (ev.type === 'done') {
+          log(`[完了] ${ev.audio_sec}s 音声 / ${Math.round(performance.now() - t0)}ms (RTF ${ev.rtf})`);
+        }
+      };
+
+      const reader = res.body.pipeThrough(new TextDecoderStream()).getReader();
+      let buf = '';
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += value;
+        let i;
+        while ((i = buf.indexOf('\n')) >= 0) {
+          const line = buf.slice(0, i).trim();
+          buf = buf.slice(i + 1);
+          if (line) handle(JSON.parse(line));
+        }
+      }
+      if (buf.trim()) handle(JSON.parse(buf));
     }
   }
 
-  CX.normKey = normKey;
-  CX.similarity = similarity;
   CX.TtsClient = TtsClient;
 })((window.CX = window.CX || {}));

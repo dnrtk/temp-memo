@@ -18,13 +18,11 @@ window.CONCIERGE_CONFIG = {
 
   tts: {
     enabled: true,
-    baseUrl: '/tts', // 直接なら例: 'http://127.0.0.1:8080'
-    // /v1/audio/speech に { input: 文, ...params } を送る
-    // キャッシュの一致に効く可能性があるので、運用中はここを変えないこと
-    params: { inference_timesteps: 5 },
-    // 句読点や空白、全角半角の違いだけならキャッシュ済みの文に合わせる(常に有効)。
-    // 0.9 などにすると「ほぼ同じ」文もキャッシュ済みの文に寄せる(画面の表示は元の文のまま)
-    fuzzyMatch: 0
+    baseUrl: '/tts', // 直接なら例: 'http://127.0.0.1:8082'(AivisSpeech は CORS ヘッダを返さないので serve.py 経由を推奨)
+    // AivisSpeech の /v1/audio/speech/events に { input: 文, ...params } を送り、文ごとに届いた音声から鳴らす
+    // 省略したキーはサーバの既定値(阿井田 茂 / Heavy、speed 0.9 など)。例:
+    //   params: { speaker: 'まお', style: 'おちつき', speed: 1.0 }
+    params: {}
   },
 
   ui: {
