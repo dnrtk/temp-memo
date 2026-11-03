@@ -1,0 +1,53 @@
+services:
+  # 推論エンジン本体(上流の公式イメージを無改変で使用)。ホストには公開せず、前段の api 経由でのみ到達する
+  aivisspeech:
+    image: "${AIVIS_IMAGE:-ghcr.io/aivis-project/aivisspeech-engine:cpu-latest}"
+    container_name: aivisspeech-server
+    init: true
+    restart: unless-stopped
+    volumes:
+      # 声モデル(.aivmx)・ユーザー辞書の置き場。初回起動時に既定モデルが Models/ にダウンロードされる
+      - ./data:/home/user/.local/share/AivisSpeech-Engine-Dev
+    environment:
+      OMP_NUM_THREADS: "${THREADS:-8}"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "-m", "5", "-o", "/dev/null", "http://127.0.0.1:10101/version"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 180s
+
+  # VoxCPM2_server と同じ I/F を提供するアダプタ + ライセンスゲート(標準ライブラリのみの Python スクリプト)
+  api:
+    image: python:3.12-slim-bookworm
+    container_name: aivisspeech-api
+    init: true
+    restart: unless-stopped
+    depends_on:
+      aivisspeech:
+        condition: service_healthy
+    command: ["python", "-u", "/app/aivis_api.py"]
+    ports:
+      # 既定は自分のPCからのみ(認証が無いため)。LAN公開は .env の BIND_ADDR=0.0.0.0
+      - "${BIND_ADDR:-127.0.0.1}:${PORT:-8082}:8080"
+    volumes:
+      - ./proxy:/app:ro
+    environment:
+      PORT: "8080"
+      UPSTREAM_HOST: "aivisspeech"
+      UPSTREAM_PORT: "10101"
+      DEFAULT_SPEAKER: "${DEFAULT_SPEAKER:-}"
+      DEFAULT_STYLE: "${DEFAULT_STYLE:-ノーマル}"
+      DEFAULT_SPEED: "${DEFAULT_SPEED:-}"
+      DEFAULT_INTONATION_SCALE: "${DEFAULT_INTONATION_SCALE:-}"
+      DEFAULT_TEMPO_DYNAMICS_SCALE: "${DEFAULT_TEMPO_DYNAMICS_SCALE:-}"
+      DEFAULT_PITCH_SCALE: "${DEFAULT_PITCH_SCALE:-}"
+      DEFAULT_VOLUME_SCALE: "${DEFAULT_VOLUME_SCALE:-}"
+      OUTPUT_SAMPLE_RATE: "${OUTPUT_SAMPLE_RATE:-}"
+      OUTPUT_RMS_DBFS: "${OUTPUT_RMS_DBFS:-}"
+      LICENSE_ALLOW: "${LICENSE_ALLOW:-# Aivis Common Model License (ACML)}"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('127.0.0.1', 8080), 3).close()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3

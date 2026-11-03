@@ -1,0 +1,7 @@
+# 声モデル(数百MB)・ユーザー辞書・ログ
+data/
+# smoke-test の出力
+out/
+# Python のバイトコード
+__pycache__/
+*.pyc
